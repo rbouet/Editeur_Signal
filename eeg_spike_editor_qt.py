@@ -1,19 +1,13 @@
 import sys
 import numpy as np
-from PySide6 import QtWidgets, QtCore
-import pyqtgraph as pg
-from scipy.signal import butter, filtfilt, iirnotch
-
-import sys
-import numpy as np
 import pandas as pd
 from PySide6 import QtWidgets, QtCore
 import pyqtgraph as pg
 from scipy.signal import butter, filtfilt, iirnotch
 
 
+# ---------------- ViewBox custom ----------------
 class EEGViewBox(pg.ViewBox):
-    """ViewBox custom : molette OK (zoom temporel), drag souris interdit."""
     def __init__(self, editor=None):
         super().__init__(enableMenu=False)
         self.editor = editor
@@ -23,15 +17,30 @@ class EEGViewBox(pg.ViewBox):
             self.editor.on_wheel(ev)
         ev.accept()
 
+    def mousePressEvent(self, ev):
+        if self.editor is not None:
+            self.editor.on_mouse_press(ev)
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if self.editor is not None:
+            self.editor.on_mouse_move(ev)
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        if self.editor is not None:
+            self.editor.on_mouse_release(ev)
+        ev.accept()
+
     def mouseDragEvent(self, ev, axis=None):
-        # Interdire tout drag souris
         ev.ignore()
 
 
+# ---------------- EEG Editor ----------------
 class EEGEditor(QtWidgets.QMainWindow):
-    def __init__(self, signals, times, channel_names, markers_df=None,
-                 window_sec=20, n_display=20):
+    def __init__(self, signals, times, channel_names, markers_df=None):
         super().__init__()
+
         self.signals_raw = signals.copy()
         self.signals = signals.copy()
         self.times = times
@@ -41,112 +50,111 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.n_channels, self.n_times = signals.shape
         self.fs = 1 / np.mean(np.diff(times))
 
-        self.window_sec = float(window_sec)
-        self.n_display = int(n_display)
+        self.window_sec = 20.0
+        self.n_display = 20
         self.current_chan_start = 0
-        self.gain = 1.0
         self.start_idx = 0
+        self.gain = 1.0
+        self.channel_spacing = np.percentile(np.abs(signals), 95) * 3
 
-        self.channel_spacing = np.percentile(np.abs(self.signals), 95) * 2
-        self.channel_spacing = max(self.channel_spacing, 1e-6)
+        self.rm_mode = False
+        self.dragging = False
+        self.drag_t0 = None
+        self.selection_item = None
+        self._undo_stack = []
 
         self._init_ui()
         self._plot_signals()
 
     # ---------------- UI ----------------
     def _init_ui(self):
-        self.setWindowTitle("EEG Editor")
+        self.setWindowTitle("EEG Spike Editor")
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
 
-        # Plot avec ViewBox custom
         self.view_box = EEGViewBox(editor=self)
         self.plot_widget = pg.PlotWidget(viewBox=self.view_box, background='w')
         self.plot_widget.showGrid(x=True, y=False)
         self.plot_widget.setLabel('bottom', 'Temps (s)')
-        self.plot_widget.getPlotItem().hideAxis('left')
-        self.plot_widget.setMenuEnabled(False)
+        self.plot_item = self.plot_widget.getPlotItem()
+        self.plot_item.getAxis('left').setTicks(self._make_channel_ticks())
         layout.addWidget(self.plot_widget)
 
-        # Ascenseur temporel
         self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(self.n_times - 1)
         self.slider.valueChanged.connect(self._on_slider)
         layout.addWidget(self.slider)
 
-        # Controls
-        controls = QtWidgets.QHBoxLayout()
+        controls = QtWidgets.QGridLayout()
         layout.addLayout(controls)
 
-        self.btn_prev = QtWidgets.QPushButton("<< Channels")
-        self.btn_next = QtWidgets.QPushButton("Channels >>")
-        self.btn_zoom_in = QtWidgets.QPushButton("+")
-        self.btn_zoom_out = QtWidgets.QPushButton("-")
+        self.btn_plus = QtWidgets.QPushButton("+")
+        self.btn_minus = QtWidgets.QPushButton("-")
+        self.btn_prev = QtWidgets.QPushButton("Chan Prev")
+        self.btn_next = QtWidgets.QPushButton("Chan Next")
+        self.btn_rm = QtWidgets.QPushButton("rm Spike")
+        self.btn_rm.setCheckable(True)
         self.btn_exit = QtWidgets.QPushButton("Exit")
+        self.btn_save = QtWidgets.QPushButton("Save mk")
+        self.btn_undo = QtWidgets.QPushButton("Undo")
 
         self.bp_low = QtWidgets.QDoubleSpinBox()
-        self.bp_low.setRange(0.1, 200)
-        self.bp_low.setValue(1.0)
         self.bp_high = QtWidgets.QDoubleSpinBox()
-        self.bp_high.setRange(0.1, 200)
+        self.bp_low.setValue(1.0)
         self.bp_high.setValue(50.0)
-        self.btn_bp = QtWidgets.QPushButton("Band-pass")
+        self.bp_low.setSuffix(" Hz")
+        self.bp_high.setSuffix(" Hz")
 
         self.notch_freq = QtWidgets.QDoubleSpinBox()
-        self.notch_freq.setRange(1, 200)
         self.notch_freq.setValue(50.0)
-        self.btn_notch = QtWidgets.QPushButton("Notch")
+        self.notch_freq.setSuffix(" Hz")
 
-        self.btn_reset = QtWidgets.QPushButton("Reset filtres")
+        self.btn_bp = QtWidgets.QPushButton("Apply Band-pass")
+        self.btn_notch = QtWidgets.QPushButton("Apply Notch")
 
-        for w in [self.btn_prev, self.btn_next, self.btn_zoom_in,
-                  self.btn_zoom_out,
-                  QtWidgets.QLabel("BP low (Hz)"), self.bp_low,
-                  QtWidgets.QLabel("BP high (Hz)"), self.bp_high, self.btn_bp,
-                  QtWidgets.QLabel("Notch (Hz)"), self.notch_freq, self.btn_notch,
-                  self.btn_reset, self.btn_exit]:
-            controls.addWidget(w)
+        controls.addWidget(self.btn_plus, 0, 0)
+        controls.addWidget(self.btn_minus, 0, 1)
+        controls.addWidget(self.btn_prev, 0, 3)
+        controls.addWidget(self.btn_next, 0, 4)
+        controls.addWidget(self.btn_exit, 3, 5)
 
+        controls.addWidget(self.btn_rm, 3, 0)
+        controls.addWidget(self.btn_undo, 3, 1)
+        controls.addWidget(self.btn_save, 3, 2)
+
+        controls.addWidget(QtWidgets.QLabel("BP low"), 1, 0)
+        controls.addWidget(self.bp_low, 1, 1)
+        controls.addWidget(QtWidgets.QLabel("BP high"), 2, 0)
+        controls.addWidget(self.bp_high, 2, 1)
+        controls.addWidget(self.btn_bp, 1, 2)
+
+#        controls.addWidget(QtWidgets.QLabel("Notch"), 1, 3)
+        controls.addWidget(self.notch_freq, 1, 3)
+        controls.addWidget(self.btn_notch, 1, 4)
+
+        self.btn_plus.clicked.connect(self._zoom_in)
+        self.btn_minus.clicked.connect(self._zoom_out)
         self.btn_prev.clicked.connect(self._prev_channels)
         self.btn_next.clicked.connect(self._next_channels)
-        self.btn_zoom_in.clicked.connect(self._zoom_in)
-        self.btn_zoom_out.clicked.connect(self._zoom_out)
+        self.btn_rm.clicked.connect(self._toggle_rm_mode)
+        self.btn_undo.clicked.connect(self._undo_last_removal)
         self.btn_exit.clicked.connect(self.close)
         self.btn_bp.clicked.connect(self._apply_bandpass)
         self.btn_notch.clicked.connect(self._apply_notch)
-        self.btn_reset.clicked.connect(self._reset_filters)
+        self.btn_save.clicked.connect(self._save_markers)
 
-    # ---------------- Molette souris ----------------
-    def on_wheel(self, ev):
-        delta = ev.delta()
-        # Zoom temporel (taille de fenêtre)
-        self.window_sec *= 0.9 if delta > 0 else 1.1
-        self.window_sec = float(np.clip(self.window_sec, 1.0, 60.0))
-        self._plot_signals()
-
-    # ---------------- Clavier ----------------
-    def keyPressEvent(self, event):
-        step = int(self.fs)  # 1 seconde
-        if event.key() == QtCore.Qt.Key_Left:
-            self.slider.setValue(max(0, self.slider.value() - step))
-        elif event.key() == QtCore.Qt.Key_Right:
-            self.slider.setValue(min(self.slider.maximum(), self.slider.value() + step))
-
-    # ---------------- Navigation ----------------
-    def _on_slider(self, value):
-        self.start_idx = int(value)
-        self._plot_signals()
-
+    # ---------------- Zoom ----------------
     def _zoom_in(self):
-        self.gain = min(self.gain * 1.2, 20)
+        self.gain *= 1.2
         self._plot_signals()
 
     def _zoom_out(self):
-        self.gain = max(self.gain / 1.2, 0.05)
+        self.gain /= 1.2
         self._plot_signals()
 
+    # ---------------- Channel navigation ----------------
     def _prev_channels(self):
         self.current_chan_start = max(0, self.current_chan_start - self.n_display)
         self._plot_signals()
@@ -156,55 +164,129 @@ class EEGEditor(QtWidgets.QMainWindow):
                                       self.current_chan_start + self.n_display)
         self._plot_signals()
 
-    # ---------------- Filtres ----------------
-    def _apply_bandpass(self):
-        low = self.bp_low.value()
-        high = self.bp_high.value()
-        nyq = self.fs / 2
-        if low >= high or high >= nyq:
-            QtWidgets.QMessageBox.warning(self, "Erreur filtre",
-                                          "Fréquences band-pass invalides.")
+    # ---------------- Mouse ----------------
+    def on_mouse_press(self, ev):
+        if not self.rm_mode:
+            return
+        pos = ev.scenePos()
+        mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+        self.drag_t0 = mouse_point.x()
+        self.dragging = True
+        self.selection_item = pg.LinearRegionItem(values=(self.drag_t0, self.drag_t0),
+                                                 brush=(255, 0, 0, 40))
+        self.plot_widget.addItem(self.selection_item)
+
+    def on_mouse_move(self, ev):
+        if self.rm_mode and self.dragging:
+            pos = ev.scenePos()
+            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+            self.selection_item.setRegion((self.drag_t0, mouse_point.x()))
+
+    def on_mouse_release(self, ev):
+        if not self.rm_mode or not self.dragging:
+            return
+        t0, t1 = self.selection_item.getRegion()
+        self._remove_markers_in_window(t0, t1)
+        self.plot_widget.removeItem(self.selection_item)
+        self.selection_item = None
+        self.dragging = False
+
+    # ---------------- rm Spike ----------------
+    def _toggle_rm_mode(self):
+        self.rm_mode = self.btn_rm.isChecked()
+        self.btn_rm.setStyleSheet("background-color: red; color: white;" if self.rm_mode else "")
+
+    def _remove_markers_in_window(self, t0, t1):
+        if self.markers_df is None or len(self.markers_df) == 0:
             return
 
-        b, a = butter(4, [low, high], btype='band', fs=self.fs)
+        # Sauvegarde pour undo
+        self._undo_stack.append(self.markers_df.copy())
+
+        s0, s1 = sorted([int(t0 * self.fs), int(t1 * self.fs)])
+
+        visible_channels = self.channel_names[
+            self.current_chan_start : self.current_chan_start + self.n_display
+        ]
+
+        mask_time = (self.markers_df["sample"] >= s0) & \
+                    (self.markers_df["sample"] <= s1)
+
+        mask_chan = self.markers_df["channel"].isin(visible_channels)
+
+        mask_delete = mask_time & mask_chan
+
+        self.markers_df = self.markers_df[~mask_delete].reset_index(drop=True)
+        self._plot_signals()
+
+
+    # ---------------- Save ----------------
+    def _save_markers(self):
+        if self.markers_df is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save markers", "", "Text (*.txt)")
+        if path:
+            out = self.markers_df.rename(columns={"sample": "sample_index"})
+            out.to_csv(path, sep="\t", index=False)
+
+    # ---------------- Filters ----------------
+    def _apply_bandpass(self):
+        low, high = self.bp_low.value(), self.bp_high.value()
+        b, a = butter(4, [low / (self.fs / 2), high / (self.fs / 2)], btype='band')
         self.signals = filtfilt(b, a, self.signals_raw, axis=1)
         self._plot_signals()
 
     def _apply_notch(self):
         f0 = self.notch_freq.value()
-        nyq = self.fs / 2
-        if f0 <= 0 or f0 >= nyq:
-            QtWidgets.QMessageBox.warning(self, "Erreur filtre",
-                                          "Fréquence notch invalide.")
-            return
-
         b, a = iirnotch(f0, 30, self.fs)
-        self.signals = filtfilt(b, a, self.signals_raw, axis=1)
+        self.signals = filtfilt(b, a, self.signals, axis=1)
         self._plot_signals()
 
-    def _reset_filters(self):
-        self.signals = self.signals_raw.copy()
+    # ---------------- Navigation ----------------
+    def on_wheel(self, ev):
+        self.window_sec *= 0.9 if ev.delta() > 0 else 1.1
+        self.window_sec = float(np.clip(self.window_sec, 1, 60))
         self._plot_signals()
 
+    def _on_slider(self, value):
+        self.start_idx = value
+        self._plot_signals()
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Right:
+            self.slider.setValue(min(self.start_idx + int(self.fs), self.n_times - 1))
+        elif event.key() == QtCore.Qt.Key_Left:
+            self.slider.setValue(max(self.start_idx - int(self.fs), 0))
+
+    def _undo_last_removal(self):
+        if len(self._undo_stack) == 0:
+            return
+        self.markers_df = self._undo_stack.pop()
+        self._plot_signals()
 
     # ---------------- Plot ----------------
+    def _make_channel_ticks(self):
+        ticks = []
+        offset = 0
+        for i in range(self.current_chan_start,
+                       min(self.current_chan_start + self.n_display, self.n_channels)):
+            ticks.append((offset, self.channel_names[i]))
+            offset += self.channel_spacing
+        return [ticks]
+
     def _plot_signals(self):
         self.plot_widget.clear()
+        self.plot_item.getAxis('left').setTicks(self._make_channel_ticks())
+
         win_len = int(self.window_sec * self.fs)
         end_idx = min(self.start_idx + win_len, self.n_times)
 
-        ch_start = self.current_chan_start
-        ch_end = min(ch_start + self.n_display, self.n_channels)
-
-        offset = 0.0
-        for ch in range(ch_start, ch_end):
+        offset = 0
+        for ch in range(self.current_chan_start,
+                        min(self.current_chan_start + self.n_display, self.n_channels)):
             sig = self.signals[ch, self.start_idx:end_idx] * self.gain
             t = self.times[self.start_idx:end_idx]
-
-            self.plot_widget.plot(t, sig + offset, pen=pg.mkPen('k', width=1))
-            label = pg.TextItem(self.channel_names[ch], color='k', anchor=(1, 0.5))
-            label.setPos(t[0], offset)
-            self.plot_widget.addItem(label)
+            self.plot_widget.plot(t, sig + offset, pen=pg.mkPen('k'))
 
             if self.markers_df is not None:
                 rows = self.markers_df[self.markers_df["channel"] == self.channel_names[ch]]
@@ -213,10 +295,8 @@ class EEGEditor(QtWidgets.QMainWindow):
                     if self.start_idx <= idx < end_idx:
                         self.plot_widget.plot([self.times[idx]],
                                               [self.signals[ch, idx] * self.gain + offset],
-                                              pen=None,
-                                              symbol='star',
-                                              symbolBrush='r',
-                                              symbolSize=12)
-
+                                              pen=None, symbol='star',
+                                              symbolBrush='r', symbolSize=12)
             offset += self.channel_spacing
+
 
