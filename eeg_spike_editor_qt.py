@@ -38,7 +38,8 @@ class EEGViewBox(pg.ViewBox):
 
 # ---------------- EEG Editor ----------------
 class EEGEditor(QtWidgets.QMainWindow):
-    def __init__(self, signals, times, channel_names, markers_df=None):
+    def __init__(self, signals, times, channel_names, markers_df=None,
+                 window_sec=20, n_display=20):
         super().__init__()
 
         self.signals_raw = signals.copy()
@@ -50,8 +51,8 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.n_channels, self.n_times = signals.shape
         self.fs = 1 / np.mean(np.diff(times))
 
-        self.window_sec = 20.0
-        self.n_display = 20
+        self.window_sec = window_sec
+        self.n_display = n_display
         self.current_chan_start = 0
         self.start_idx = 0
         self.gain = 1.0
@@ -62,6 +63,9 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.drag_t0 = None
         self.selection_item = None
         self._undo_stack = []
+
+        self.curves = {}
+        self.spike_items = {}
 
         self._init_ui()
         self._plot_signals()
@@ -124,17 +128,12 @@ class EEGEditor(QtWidgets.QMainWindow):
         controls.addWidget(self.btn_undo, 3, 1)
         controls.addWidget(self.btn_save, 3, 2)
 
-        label = QtWidgets.QLabel("BP low")
-        label.setAlignment(QtCore.Qt.AlignRight)  # alignement à droite
-        controls.addWidget(label, 1, 0)
+        controls.addWidget(QtWidgets.QLabel("BP low"), 1, 0)
         controls.addWidget(self.bp_low, 1, 1)
-        label = QtWidgets.QLabel("BP high")
-        label.setAlignment(QtCore.Qt.AlignRight)  # alignement à droite
-        controls.addWidget(label, 2, 0)
+        controls.addWidget(QtWidgets.QLabel("BP high"), 2, 0)
         controls.addWidget(self.bp_high, 2, 1)
         controls.addWidget(self.btn_bp, 1, 2)
 
-#        controls.addWidget(QtWidgets.QLabel("Notch"), 1, 3)
         controls.addWidget(self.notch_freq, 1, 3)
         controls.addWidget(self.btn_notch, 1, 4)
 
@@ -204,7 +203,6 @@ class EEGEditor(QtWidgets.QMainWindow):
         if self.markers_df is None or len(self.markers_df) == 0:
             return
 
-        # Sauvegarde pour undo
         self._undo_stack.append(self.markers_df.copy())
 
         s0, s1 = sorted([int(t0 * self.fs), int(t1 * self.fs)])
@@ -213,16 +211,19 @@ class EEGEditor(QtWidgets.QMainWindow):
             self.current_chan_start : self.current_chan_start + self.n_display
         ]
 
-        mask_time = (self.markers_df["sample"] >= s0) & \
-                    (self.markers_df["sample"] <= s1)
-
+        mask_time = (self.markers_df["sample"] >= s0) & (self.markers_df["sample"] <= s1)
         mask_chan = self.markers_df["channel"].isin(visible_channels)
-
         mask_delete = mask_time & mask_chan
 
         self.markers_df = self.markers_df[~mask_delete].reset_index(drop=True)
         self._plot_signals()
 
+    # ---------------- Undo ----------------
+    def _undo_last_removal(self):
+        if len(self._undo_stack) == 0:
+            return
+        self.markers_df = self._undo_stack.pop()
+        self._plot_signals()
 
     # ---------------- Save ----------------
     def _save_markers(self):
@@ -262,12 +263,6 @@ class EEGEditor(QtWidgets.QMainWindow):
         elif event.key() == QtCore.Qt.Key_Left:
             self.slider.setValue(max(self.start_idx - int(self.fs), 0))
 
-    def _undo_last_removal(self):
-        if len(self._undo_stack) == 0:
-            return
-        self.markers_df = self._undo_stack.pop()
-        self._plot_signals()
-
     # ---------------- Plot ----------------
     def _make_channel_ticks(self):
         ticks = []
@@ -280,27 +275,54 @@ class EEGEditor(QtWidgets.QMainWindow):
 
     def _plot_signals(self):
         self.plot_widget.clear()
+        self.curves.clear()
+        self.spike_items.clear()
+
         self.plot_item.getAxis('left').setTicks(self._make_channel_ticks())
 
         win_len = int(self.window_sec * self.fs)
         end_idx = min(self.start_idx + win_len, self.n_times)
 
         offset = 0
-        for ch in range(self.current_chan_start,
-                        min(self.current_chan_start + self.n_display, self.n_channels)):
-            sig = self.signals[ch, self.start_idx:end_idx] * self.gain
+        for ch_idx in range(self.current_chan_start,
+                            min(self.current_chan_start + self.n_display, self.n_channels)):
+
+            sig = self.signals[ch_idx, self.start_idx:end_idx] * self.gain
             t = self.times[self.start_idx:end_idx]
+
             self.plot_widget.plot(t, sig + offset, pen=pg.mkPen('k'))
 
-            if self.markers_df is not None:
-                rows = self.markers_df[self.markers_df["channel"] == self.channel_names[ch]]
-                for _, r in rows.iterrows():
-                    idx = int(r["sample"])
-                    if self.start_idx <= idx < end_idx:
-                        self.plot_widget.plot([self.times[idx]],
-                                              [self.signals[ch, idx] * self.gain + offset],
-                                              pen=None, symbol='star',
-                                              symbolBrush='r', symbolSize=12)
+            scatter = pg.ScatterPlotItem(pen=None,
+                                         brush=pg.mkBrush(255, 0, 0),
+                                         symbol='star',
+                                         size=12)
+            self.plot_widget.addItem(scatter)
+            self.spike_items[ch_idx] = scatter
+
             offset += self.channel_spacing
 
+        self._update_spikes_display()
 
+    def _update_spikes_display(self):
+        if self.markers_df is None:
+            return
+
+        win_len = int(self.window_sec * self.fs)
+        end_idx = min(self.start_idx + win_len, self.n_times)
+
+        offset = 0
+        for ch_idx in range(self.current_chan_start,
+                            min(self.current_chan_start + self.n_display, self.n_channels)):
+
+            rows = self.markers_df[self.markers_df["channel"] == self.channel_names[ch_idx]]
+            idx = rows["sample"].values
+
+            mask = (idx >= self.start_idx) & (idx < end_idx)
+            idx = idx[mask]
+
+            x = self.times[idx]
+            y = self.signals[ch_idx, idx] * self.gain + offset
+
+            self.spike_items[ch_idx].setData(x, y)
+
+            offset += self.channel_spacing
