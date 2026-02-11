@@ -220,20 +220,3 @@ class EEGEditor(QtWidgets.QMainWindow):
 
             offset += self.channel_spacing
 
-
-# ---------------- Example main ----------------
-
-def main():
-   
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-
-    editor = EEGEditor(signals, times, channel_names, markers_df)
-    editor.show()
-    editor.resize(1400, 2500)
-    app.exec()
-
-
-if __name__ == "__main__":
-    main()
