@@ -74,7 +74,7 @@ class EEGEditor(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(central)
 
         self.view_box = EEGViewBox(editor=self)
-        self.plot_widget = pg.PlotWidget(viewBox=self.view_box, background='w')
+        self.plot_widget = pg.PlotWidget(viewBox=self.view_box, background='#F0F0F0')
         self.plot_widget.showGrid(x=True, y=False)
         self.plot_widget.setLabel('bottom', 'Temps (s)')
         self.plot_item = self.plot_widget.getPlotItem()
@@ -124,9 +124,13 @@ class EEGEditor(QtWidgets.QMainWindow):
         controls.addWidget(self.btn_undo, 3, 1)
         controls.addWidget(self.btn_save, 3, 2)
 
-        controls.addWidget(QtWidgets.QLabel("BP low"), 1, 0)
+        label = QtWidgets.QLabel("BP low")
+        label.setAlignment(QtCore.Qt.AlignRight)  # alignement à droite
+        controls.addWidget(label, 1, 0)
         controls.addWidget(self.bp_low, 1, 1)
-        controls.addWidget(QtWidgets.QLabel("BP high"), 2, 0)
+        label = QtWidgets.QLabel("BP high")
+        label.setAlignment(QtCore.Qt.AlignRight)  # alignement à droite
+        controls.addWidget(label, 2, 0)
         controls.addWidget(self.bp_high, 2, 1)
         controls.addWidget(self.btn_bp, 1, 2)
 
