@@ -72,7 +72,7 @@ class EEGEditor(QtWidgets.QMainWindow):
 
     # ---------------- UI ----------------
     def _init_ui(self):
-        self.setWindowTitle("EEG Spike Editor")
+        self.setWindowTitle("sEEG Spike Editor")
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
@@ -143,7 +143,7 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_next.clicked.connect(self._next_channels)
         self.btn_rm.clicked.connect(self._toggle_rm_mode)
         self.btn_undo.clicked.connect(self._undo_last_removal)
-        self.btn_exit.clicked.connect(self.close)
+        self.btn_exit.clicked.connect(self._exit_app)
         self.btn_bp.clicked.connect(self._apply_bandpass)
         self.btn_notch.clicked.connect(self._apply_notch)
         self.btn_save.clicked.connect(self._save_markers)
@@ -258,10 +258,23 @@ class EEGEditor(QtWidgets.QMainWindow):
         self._plot_signals()
 
     def keyPressEvent(self, event):
-        if event.key() == QtCore.Qt.Key_Right:
-            self.slider.setValue(min(self.start_idx + int(self.fs), self.n_times - 1))
-        elif event.key() == QtCore.Qt.Key_Left:
-            self.slider.setValue(max(self.start_idx - int(self.fs), 0))
+        match event.key():
+            case QtCore.Qt.Key_Right:
+                self.slider.setValue(min(self.start_idx + int(self.fs), self.n_times - 1))
+            case QtCore.Qt.Key_Left:
+                self.slider.setValue(max(self.start_idx - int(self.fs), 0))
+            case QtCore.Qt.Key_Up:
+                self._prev_channels()
+            case QtCore.Qt.Key_Down:
+                self._next_channels()
+            case QtCore.Qt.Key_PageDown:
+                self.slider.setValue(min(self.start_idx + (self.window_sec * int(self.fs)), self.n_times - 1))
+            case QtCore.Qt.Key_PageUp:
+                self.slider.setValue(max(self.start_idx - (self.window_sec * int(self.fs)), 0))
+            case QtCore.Qt.Key_Plus:
+                self._zoom_in()
+            case QtCore.Qt.Key_Minus:
+                self._zoom_out()
 
     # ---------------- Plot ----------------
     def _make_channel_ticks(self):
@@ -326,3 +339,19 @@ class EEGEditor(QtWidgets.QMainWindow):
             self.spike_items[ch_idx].setData(x, y)
 
             offset += self.channel_spacing
+
+    def closeEvent(self, event):
+        # Supprime explicitement les items graphiques
+        self.plot_widget.clear()
+        self.plot_widget.setParent(None)
+        self.plot_widget.deleteLater()
+
+        # Coupe les références circulaires (important avec ViewBox custom)
+        self.view_box.editor = None
+
+        event.accept()
+        
+    def _exit_app(self):
+        self.close()
+        QtWidgets.QApplication.quit()
+
