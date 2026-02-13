@@ -1,3 +1,29 @@
+required_packages = [
+    "numpy",
+    "pandas",
+    "pyqtgraph",
+    "PySide6",
+    "scipy",
+    "mne",
+    "mne_connectivity",
+    "antropy",
+    "neurokit2",
+    "pyinform",
+    "sklearn"
+]
+
+missing = []
+for pkg in required_packages:
+    try:
+        __import__(pkg)
+        print(f"package {pkg} OK")
+    except ImportError:
+        print(f"package {pkg} NON installé")
+        missing.append(pkg)
+  
+#if missing:
+#    print("\nPackages manquants :", missing)
+
 import sys
 import numpy as np
 import pandas as pd
@@ -5,6 +31,7 @@ from PySide6 import QtWidgets, QtCore
 import pyqtgraph as pg
 from scipy.signal import butter, filtfilt, iirnotch
 
+# pip install PySide6 IPython pyqtgraph numpy pandas scipy
 
 # ---------------- ViewBox custom ----------------
 class EEGViewBox(pg.ViewBox):
@@ -354,4 +381,55 @@ class EEGEditor(QtWidgets.QMainWindow):
     def _exit_app(self):
         self.close()
         QtWidgets.QApplication.quit()
+        
 
+def launch_editor(signals, times, channel_names, markers_df=None,
+                  window_sec=20, n_display=60,
+                  resize=(1500, 800), move=(50, 200)):
+    """
+    Lance l'éditeur EEG avec gestion propre de QApplication.
+    Compatible Jupyter / IPython et scripts classiques.
+    """
+
+    from PySide6 import QtWidgets
+
+    # Cas Jupyter : active l'intégration Qt si besoin
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is not None:
+            ip.run_line_magic("gui", "qt")
+    except Exception:
+        pass
+
+    app = QtWidgets.QApplication.instance()
+    created_app = False
+    if app is None:
+        app = QtWidgets.QApplication(sys.argv)
+        created_app = True
+
+    editor = EEGEditor(
+        signals=signals,
+        times=times,
+        channel_names=channel_names,
+        markers_df=markers_df,
+        window_sec=window_sec,
+        n_display=n_display
+    )
+
+    editor.show()
+    editor.resize(*resize)
+    editor.move(*move)
+
+    # Fermeture propre
+    def _on_close():
+        editor.deleteLater()
+        if created_app:
+            app.quit()
+
+    editor.destroyed.connect(_on_close)
+
+    if created_app:
+        app.exec()
+
+    return editor

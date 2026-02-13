@@ -46,6 +46,8 @@ QtWidgets.QApplication.quit()
 
 
 # Dépendances
+pip install numpy pandas scipy PySide6 pyqtgraph mne mne-connectivity antropy neurokit2 scikit-learn pyinform
+pip show numpy pandas scipy PySide6 pyqtgraph mne mne-connectivity antropy neurokit2 scikit-learn pyinform
 
 Python ≥ 3.9     
 PySide6      
