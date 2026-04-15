@@ -253,18 +253,10 @@ class EEGEditor(QtWidgets.QMainWindow):
         selected_channel = None
         selected_idx = None
 
-        for ch_idx in range(self.current_chan_start,
-                            min(self.current_chan_start + self.n_display, self.n_channels)):
-
-            if offset <= y_click < offset + self.channel_spacing:
-                selected_channel = self.channel_names[ch_idx]
-                selected_idx = ch_idx
-                break
-
-            offset += self.channel_spacing
+        selected_channel, selected_idx = self._get_closest_channel(t_click, y_click)
 
         if selected_channel is None:
-            return  # clic hors signal
+            return
 
         # ---------------------------
         # 2. convertir temps → sample
@@ -328,6 +320,36 @@ class EEGEditor(QtWidgets.QMainWindow):
 
         self.markers_df = self.markers_df[~mask_delete].reset_index(drop=True)
         self._plot_signals()
+        
+    # ---------------- Find channel close to clic ----------------
+    def _get_closest_channel(self, t_click, y_click):
+
+        sample = int(t_click * self.fs)
+
+        # sécurité
+        if sample < 0 or sample >= self.n_times:
+            return None, None
+
+        offset = 0
+        best_dist = np.inf
+        best_channel = None
+        best_idx = None
+
+        for ch_idx in range(self.current_chan_start,
+                            min(self.current_chan_start + self.n_display, self.n_channels)):
+
+            y_signal = self.signals[ch_idx, sample] * self.gain + offset
+
+            dist = abs(y_click - y_signal)
+
+            if dist < best_dist:
+                best_dist = dist
+                best_channel = self.channel_names[ch_idx]
+                best_idx = ch_idx
+
+            offset += self.channel_spacing
+
+        return best_channel, best_idx
 
     # ---------------- Add ----------------
     def _toggle_add_mode(self):
