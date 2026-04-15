@@ -96,6 +96,8 @@ class EEGEditor(QtWidgets.QMainWindow):
 
         self._init_ui()
         self._plot_signals()
+        
+        self.add_mode = False
 
     # ---------------- UI ----------------
     def _init_ui(self):
@@ -125,6 +127,8 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_minus = QtWidgets.QPushButton("-")
         self.btn_prev = QtWidgets.QPushButton("Chan Prev")
         self.btn_next = QtWidgets.QPushButton("Chan Next")
+        self.btn_add = QtWidgets.QPushButton("Add Spike")
+        self.btn_add.setCheckable(True)
         self.btn_rm = QtWidgets.QPushButton("rm Spike")
         self.btn_rm.setCheckable(True)
         self.btn_exit = QtWidgets.QPushButton("Exit")
@@ -151,9 +155,10 @@ class EEGEditor(QtWidgets.QMainWindow):
         controls.addWidget(self.btn_next, 0, 4)
         controls.addWidget(self.btn_exit, 3, 5)
 
-        controls.addWidget(self.btn_rm, 3, 0)
-        controls.addWidget(self.btn_undo, 3, 1)
-        controls.addWidget(self.btn_save, 3, 2)
+        controls.addWidget(self.btn_add, 3, 0)
+        controls.addWidget(self.btn_rm, 3, 1)
+        controls.addWidget(self.btn_undo, 3, 2)
+        controls.addWidget(self.btn_save, 3, 3)
 
         controls.addWidget(QtWidgets.QLabel("BP low"), 1, 0)
         controls.addWidget(self.bp_low, 1, 1)
@@ -168,6 +173,7 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_minus.clicked.connect(self._zoom_out)
         self.btn_prev.clicked.connect(self._prev_channels)
         self.btn_next.clicked.connect(self._next_channels)
+        self.btn_add.clicked.connect(self._toggle_add_mode)
         self.btn_rm.clicked.connect(self._toggle_rm_mode)
         self.btn_undo.clicked.connect(self._undo_last_removal)
         self.btn_exit.clicked.connect(self._exit_app)
@@ -196,6 +202,15 @@ class EEGEditor(QtWidgets.QMainWindow):
 
     # ---------------- Mouse ----------------
     def on_mouse_press(self, ev):
+        
+        # -------- ADD MODE --------
+        if self.add_mode:
+            pos = ev.scenePos()
+            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+            
+            self._add_marker_from_click(mouse_point.x(), mouse_point.y())
+            return
+        
         if not self.rm_mode:
             return
         pos = ev.scenePos()
@@ -226,6 +241,75 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.rm_mode = self.btn_rm.isChecked()
         self.btn_rm.setStyleSheet("background-color: red; color: white;" if self.rm_mode else "")
 
+    def _add_marker_from_click(self, t_click, y_click):
+
+        if self.markers_df is None:
+            self.markers_df = pd.DataFrame(columns=["channel", "sample"])
+
+        # ---------------------------
+        # 1. trouver le channel
+        # ---------------------------
+        offset = 0
+        selected_channel = None
+        selected_idx = None
+
+        for ch_idx in range(self.current_chan_start,
+                            min(self.current_chan_start + self.n_display, self.n_channels)):
+
+            if offset <= y_click < offset + self.channel_spacing:
+                selected_channel = self.channel_names[ch_idx]
+                selected_idx = ch_idx
+                break
+
+            offset += self.channel_spacing
+
+        if selected_channel is None:
+            return  # clic hors signal
+
+        # ---------------------------
+        # 2. convertir temps → sample
+        # ---------------------------
+        sample = int(t_click * self.fs)
+
+        # sécurité
+        if sample < 0 or sample >= self.n_times:
+            return
+
+        # ---------------------------
+        # 3. chercher max local ±5
+        # ---------------------------
+        window = 15
+        s0 = max(0, sample - window)
+        s1 = min(self.n_times, sample + window + 1)
+
+        segment = self.signals[selected_idx, s0:s1]
+
+        if len(segment) == 0:
+            return
+
+        local_idx = np.argmax(np.abs(segment))
+        best_sample = s0 + local_idx
+
+        # ---------------------------
+        # 4. sauvegarde pour undo
+        # ---------------------------
+        self._undo_stack.append(self.markers_df.copy())
+
+        # ---------------------------
+        # 5. ajout du marqueur
+        # ---------------------------
+        new_row = pd.DataFrame({
+            "channel": [selected_channel],
+            "sample": [best_sample]
+        })
+
+        self.markers_df = pd.concat([self.markers_df, new_row], ignore_index=True)
+
+        # ---------------------------
+        # 6. refresh affichage
+        # ---------------------------
+        self._update_spikes_display()
+
     def _remove_markers_in_window(self, t0, t1):
         if self.markers_df is None or len(self.markers_df) == 0:
             return
@@ -245,6 +329,11 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.markers_df = self.markers_df[~mask_delete].reset_index(drop=True)
         self._plot_signals()
 
+    # ---------------- Add ----------------
+    def _toggle_add_mode(self):
+        self.add_mode = self.btn_add.isChecked()
+        self.btn_add.setStyleSheet("background-color: green; color: white;" if self.add_mode else "")
+    
     # ---------------- Undo ----------------
     def _undo_last_removal(self):
         if len(self._undo_stack) == 0:
@@ -330,14 +419,15 @@ class EEGEditor(QtWidgets.QMainWindow):
             sig = self.signals[ch_idx, self.start_idx:end_idx] * self.gain
             t = self.times[self.start_idx:end_idx]
 
-            self.plot_widget.plot(t, sig + offset, pen=pg.mkPen('k'))
-
-            scatter = pg.ScatterPlotItem(pen=None,
-                                         brush=pg.mkBrush(255, 0, 0),
-                                         symbol='star',
+                                                                                        # dessine les marquages
+            scatter = pg.ScatterPlotItem(pen=pg.mkPen(color=(255, 0, 0, 70), width=2),  # contour rouge transparent(70)
+                                         brush=None,                                          
+                                         symbol='o',
                                          size=12)
             self.plot_widget.addItem(scatter)
             self.spike_items[ch_idx] = scatter
+
+            self.plot_widget.plot(t, sig + offset, pen=pg.mkPen('k'))        # Dessine les signaux
 
             offset += self.channel_spacing
 
