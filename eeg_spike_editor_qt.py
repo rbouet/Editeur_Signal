@@ -30,6 +30,7 @@ import pandas as pd
 from PySide6 import QtWidgets, QtCore
 import pyqtgraph as pg
 from scipy.signal import butter, filtfilt, iirnotch
+from scipy.signal import find_peaks
 
 # pip install PySide6 IPython pyqtgraph numpy pandas scipy
 
@@ -98,6 +99,7 @@ class EEGEditor(QtWidgets.QMainWindow):
         self._plot_signals()
         
         self.add_mode = False
+        self.add_train_mode = False
 
     # ---------------- UI ----------------
     def _init_ui(self):
@@ -134,6 +136,10 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_exit = QtWidgets.QPushButton("Exit")
         self.btn_save = QtWidgets.QPushButton("Save mk")
         self.btn_undo = QtWidgets.QPushButton("Undo")
+        self.btn_add_train = QtWidgets.QPushButton("Add train")
+        self.btn_add_train.setCheckable(True)
+        self.bp_std_deriv_train = QtWidgets.QDoubleSpinBox()
+        self.bp_std_deriv_train.setValue(0.5)
 
         self.bp_low = QtWidgets.QDoubleSpinBox()
         self.bp_high = QtWidgets.QDoubleSpinBox()
@@ -160,6 +166,9 @@ class EEGEditor(QtWidgets.QMainWindow):
         controls.addWidget(self.btn_undo, 3, 2)
         controls.addWidget(self.btn_save, 3, 3)
 
+        controls.addWidget(self.btn_add_train, 4, 0)
+        controls.addWidget(self.bp_std_deriv_train, 4, 1)
+
         controls.addWidget(QtWidgets.QLabel("BP low"), 1, 0)
         controls.addWidget(self.bp_low, 1, 1)
         controls.addWidget(QtWidgets.QLabel("BP high"), 2, 0)
@@ -180,6 +189,10 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_bp.clicked.connect(self._apply_bandpass)
         self.btn_notch.clicked.connect(self._apply_notch)
         self.btn_save.clicked.connect(self._save_markers)
+        
+
+
+        self.btn_add_train.clicked.connect(self._toggle_add_train_mode)
 
     # ---------------- Zoom ----------------
     def _zoom_in(self):
@@ -203,7 +216,24 @@ class EEGEditor(QtWidgets.QMainWindow):
     # ---------------- Mouse ----------------
     def on_mouse_press(self, ev):
         
-        # -------- ADD MODE --------
+        # -------- ADD TRAIN MODE --------
+        if self.add_train_mode:
+            pos = ev.scenePos()
+            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+            
+            self.drag_t0 = mouse_point.x()
+            self.drag_y0 = mouse_point.y()
+            self.dragging = True
+
+            self.selection_item = pg.RectROI(
+                [self.drag_t0, self.drag_y0],
+                [0.001, 0.001],
+                pen=pg.mkPen((0, 0, 255), width=2)
+            )
+            self.plot_widget.addItem(self.selection_item)
+            return
+        
+        # -------- ADD SINGLE MODE --------
         if self.add_mode:
             pos = ev.scenePos()
             mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
@@ -222,19 +252,56 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.plot_widget.addItem(self.selection_item)
 
     def on_mouse_move(self, ev):
+        # --------- RM SPIKE MODE ------------
         if self.rm_mode and self.dragging:
             pos = ev.scenePos()
             mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
             self.selection_item.setRegion((self.drag_t0, mouse_point.x()))
+            
+        # --------- ADD TRAIN MODE ---------
+        if self.add_train_mode and self.dragging:
+            pos = ev.scenePos()
+            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+
+            x0, y0 = self.drag_t0, self.drag_y0
+            x1, y1 = mouse_point.x(), mouse_point.y()
+
+            self.selection_item.setPos(min(x0, x1), min(y0, y1))
+            self.selection_item.setSize((abs(x1 - x0), abs(y1 - y0)))
+            return
 
     def on_mouse_release(self, ev):
+        
+        # ---------- ADD TRAIN MODE ----------
+        if self.add_train_mode and self.dragging:
+            roi = self.selection_item
+
+            pos = roi.pos()
+            size = roi.size()
+
+            t0, t1 = pos.x(), pos.x() + size.x()
+            y0, y1 = pos.y(), pos.y() + size.y()
+
+            self._add_train_markers(t0, t1, y0, y1)
+
+            self.plot_widget.removeItem(self.selection_item)
+            self.selection_item = None
+            self.dragging = False
+            return
+
         if not self.rm_mode or not self.dragging:
             return
-        t0, t1 = self.selection_item.getRegion()
-        self._remove_markers_in_window(t0, t1)
-        self.plot_widget.removeItem(self.selection_item)
-        self.selection_item = None
-        self.dragging = False
+
+        # ---------- RM SPIKE MODE ----------
+        if self.rm_mode and self.dragging:
+            t0, t1 = self.selection_item.getRegion()
+            self._remove_markers_in_window(t0, t1)
+            self.plot_widget.removeItem(self.selection_item)
+            self.selection_item = None
+            self.dragging = False
+            return
+        
+        
 
     # ---------------- rm Spike ----------------
     def _toggle_rm_mode(self):
@@ -301,6 +368,116 @@ class EEGEditor(QtWidgets.QMainWindow):
         # 6. refresh affichage
         # ---------------------------
         self._update_spikes_display()
+        
+   
+    def _add_train_markers(self, t0, t1, y0, y1):
+
+        if self.markers_df is None:
+            self.markers_df = pd.DataFrame(columns=["channel", "sample"])
+
+        # ---------------------------
+        # 1. bornes temporelles
+        # ---------------------------
+        s0 = max(0, int(t0 * self.fs))
+        s1 = min(self.n_times, int(t1 * self.fs))
+
+        if s1 <= s0:
+            return
+
+        # ---------------------------
+        # 2. trouver le meilleur channel
+        # ---------------------------
+        offset = 0
+        best_score = -np.inf
+        best_idx = None
+
+        for ch_idx in range(self.current_chan_start,
+                            min(self.current_chan_start + self.n_display, self.n_channels)):
+
+            sig = self.signals[ch_idx, s0:s1] * self.gain + offset
+
+            # score = nombre de points dans la fenêtre Y
+            mask = (sig >= min(y0, y1)) & (sig <= max(y0, y1))
+            score = np.sum(mask)
+
+            if score > best_score:
+                best_score = score
+                best_idx = ch_idx
+
+            offset += self.channel_spacing
+
+        if best_idx is None or best_score == 0:
+            return
+
+        selected_channel = self.channel_names[best_idx]
+
+        # ---------------------------
+        # 3. extraire segment brut (sans offset)
+        # ---------------------------
+        segment = self.signals[best_idx, s0:s1]
+
+        # ---------------------------
+        # 4. détecter pics + et -
+        # ---------------------------
+        noise_level = np.median(np.abs(segment)) / 0.6745
+
+        peaks_pos, _ = find_peaks(
+            segment,
+            prominence=2 * noise_level,
+            distance=int(0.01 * self.fs)
+        )
+
+        peaks_neg, _ = find_peaks(
+            -segment,
+            prominence=2 * noise_level,
+            distance=int(0.01 * self.fs)
+        )
+
+        peaks = np.concatenate([peaks_pos, peaks_neg])
+
+        deriv = np.diff(segment)
+
+        slope_threshold = np.std(deriv) * self.bp_std_deriv_train.value()   # réglable
+
+        good_peaks = []
+
+        for p in peaks:
+            if p <= 1 or p >= len(segment) - 2:
+                continue
+
+            slope_before = abs(deriv[p - 1])
+            slope_after  = abs(deriv[p])
+
+            if slope_before > slope_threshold and slope_after > slope_threshold:
+                good_peaks.append(p)
+
+        peaks = np.array(good_peaks)
+
+        if len(peaks) == 0:
+            return
+
+        # convertir en index global
+        peaks_global = s0 + peaks
+
+        # ---------------------------
+        # 5. undo
+        # ---------------------------
+        self._undo_stack.append(self.markers_df.copy())
+
+        # ---------------------------
+        # 6. ajout markers
+        # ---------------------------
+        new_rows = pd.DataFrame({
+            "channel": [selected_channel] * len(peaks_global),
+            "sample": peaks_global
+        })
+
+        self.markers_df = pd.concat([self.markers_df, new_rows], ignore_index=True)
+
+        # ---------------------------
+        # 7. refresh
+        # ---------------------------
+        self._update_spikes_display()
 
     def _remove_markers_in_window(self, t0, t1):
         if self.markers_df is None or len(self.markers_df) == 0:
@@ -320,6 +497,7 @@ class EEGEditor(QtWidgets.QMainWindow):
 
         self.markers_df = self.markers_df[~mask_delete].reset_index(drop=True)
         self._plot_signals()
+        
         
     # ---------------- Find channel close to clic ----------------
     def _get_closest_channel(self, t_click, y_click):
@@ -351,10 +529,17 @@ class EEGEditor(QtWidgets.QMainWindow):
 
         return best_channel, best_idx
 
-    # ---------------- Add ----------------
+    # ---------------- Add single ----------------
     def _toggle_add_mode(self):
         self.add_mode = self.btn_add.isChecked()
         self.btn_add.setStyleSheet("background-color: green; color: white;" if self.add_mode else "")
+        
+    # ---------------- Add train ----------------
+    def _toggle_add_train_mode(self):
+        self.add_train_mode = self.btn_add_train.isChecked()
+        self.btn_add_train.setStyleSheet(
+            "background-color: blue; color: white;" if self.add_train_mode else ""
+        )
     
     # ---------------- Undo ----------------
     def _undo_last_removal(self):
