@@ -18,31 +18,21 @@ Un exemple de lancement (lancement_editeur_eeg_spike.ipynb) indique comment visu
 
 Voici un exmple de lancement :      
 
-import sys       
-from PySide6 import QtWidgets       
-from eeg_spike_editor_qt import EEGEditor       
-from IPython import get_ipython       
+import sys
+sys.path.insert(0, '/Users/romain/Study/Rheins/Thalamus_Git/Thalamus_Rheins_2025/Utils')
+sys.path.insert(0, '/Users/romain/Study/plateformeintra/Editeur_Signal')
 
-get_ipython().run_line_magic("gui", "qt")      
+from eeg_spike_editor_qt import launch_editor
 
-app = QtWidgets.QApplication.instance()     
-if app is None:    
-   app = QtWidgets.QApplication(sys.argv)       
-        
-editor = EEGEditor(      
-    signals=signals,      
-    times=times,        
-    channel_names=channel_names,      
-    markers_df = markers_df,     
-    window_sec=20,       
-    n_display=40      
-    )     
-
-editor.show()       
-editor.resize(1500, 800)      
-editor.move(50, 200)        
-app.exec()    
-QtWidgets.QApplication.quit()      
+editor = launch_editor(
+    signals = signals,
+    times = times,
+    channel_names = channel_names,
+    markers_df = markers_df,
+    window_sec = 20,
+    n_display = 40
+    )
+           
 
 
 # Dépendances
