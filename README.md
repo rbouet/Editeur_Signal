@@ -58,8 +58,8 @@ scipy
 IPython    
 
 
-MAJ
-11/05/2026
-   Remove markers:
-      - One by clic
-      - Several within windows (time X channel)
+MAJ    
+11/05/2026     
+   Remove markers:     
+      - One by clic      
+      - Several within windows (time X channel)       
