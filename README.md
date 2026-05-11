@@ -58,7 +58,7 @@ scipy
 IPython    
 
 
-MAJ    
+# MAJ    
 11/05/2026     
    Remove markers:     
       - One by clic      
