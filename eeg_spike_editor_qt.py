@@ -1,40 +1,12 @@
-required_packages = [
-    "numpy",
-    "pandas",
-    "pyqtgraph",
-    "PySide6",
-    "scipy",
-    "mne",
-    "mne_connectivity",
-    "antropy",
-    "neurokit2",
-    "pyinform",
-    "sklearn"
-]
-
-missing = []
-for pkg in required_packages:
-    try:
-        __import__(pkg)
-        print(f"package {pkg} OK")
-    except ImportError:
-        print(f"package {pkg} NON installé")
-        missing.append(pkg)
-  
-#if missing:
-#    print("\nPackages manquants :", missing)
-
 import sys
+
 import numpy as np
 import pandas as pd
-from PySide6 import QtWidgets, QtCore
 import pyqtgraph as pg
-from scipy.signal import butter, filtfilt, iirnotch
-from scipy.signal import find_peaks
+from PySide6 import QtCore, QtWidgets
+from scipy.signal import butter, filtfilt, find_peaks, iirnotch
 
-# pip install PySide6 IPython pyqtgraph numpy pandas scipy
 
-# ---------------- ViewBox custom ----------------
 class EEGViewBox(pg.ViewBox):
     def __init__(self, editor=None):
         super().__init__(enableMenu=False)
@@ -64,32 +36,42 @@ class EEGViewBox(pg.ViewBox):
         ev.ignore()
 
 
-# ---------------- EEG Editor ----------------
 class EEGEditor(QtWidgets.QMainWindow):
-    def __init__(self, signals, times, channel_names, markers_df=None,
-                 window_sec=20, n_display=20):
+    def __init__(
+        self,
+        signals,
+        times,
+        channel_names,
+        markers_df=None,
+        window_sec=20,
+        n_display=20,
+    ):
         super().__init__()
 
-        self.signals_raw = signals.copy()
-        self.signals = signals.copy()
-        self.times = times
-        self.channel_names = channel_names
-        self.markers_df = markers_df
+        self.signals_raw = np.asarray(signals).copy()
+        self.signals = np.asarray(signals).copy()
+        self.times = np.asarray(times)
+        self.channel_names = list(channel_names)
+        self.markers_df = self._normalize_markers(markers_df)
 
-        self.n_channels, self.n_times = signals.shape
-        self.fs = 1 / np.mean(np.diff(times))
+        self.n_channels, self.n_times = self.signals.shape
+        self.fs = 1 / np.mean(np.diff(self.times))
 
         self.window_sec = window_sec
-        self.n_display = n_display
+        self.n_display = min(n_display, self.n_channels)
         self.current_chan_start = 0
         self.start_idx = 0
         self.gain = 1.0
-        self.channel_spacing = np.percentile(np.abs(signals), 95) * 3
+        self.channel_spacing = max(np.percentile(np.abs(self.signals), 95) * 3, 1e-12)
 
+        self.add_mode = False
+        self.add_train_mode = False
         self.rm_mode = False
         self.dragging = False
         self.drag_t0 = None
+        self.drag_y0 = None
         self.selection_item = None
+        self._mouse_down_scene_pos = None
         self._undo_stack = []
 
         self.curves = {}
@@ -97,28 +79,24 @@ class EEGEditor(QtWidgets.QMainWindow):
 
         self._init_ui()
         self._plot_signals()
-        
-        self.add_mode = False
-        self.add_train_mode = False
 
-    # ---------------- UI ----------------
     def _init_ui(self):
-        self.setWindowTitle("sEEG Spike Editor")
+        self.setWindowTitle("Edit_signal - sEEG Spike Editor")
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
 
         self.view_box = EEGViewBox(editor=self)
-        self.plot_widget = pg.PlotWidget(viewBox=self.view_box, background='#F0F0F0')
+        self.plot_widget = pg.PlotWidget(viewBox=self.view_box, background="#F0F0F0")
         self.plot_widget.showGrid(x=True, y=False)
-        self.plot_widget.setLabel('bottom', 'Temps (s)')
+        self.plot_widget.setLabel("bottom", "Temps (s)")
         self.plot_item = self.plot_widget.getPlotItem()
-        self.plot_item.getAxis('left').setTicks(self._make_channel_ticks())
+        self.plot_item.getAxis("left").setTicks(self._make_channel_ticks())
         layout.addWidget(self.plot_widget)
 
         self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setMinimum(0)
-        self.slider.setMaximum(self.n_times - 1)
+        self.slider.setMaximum(max(0, self.n_times - 1))
         self.slider.valueChanged.connect(self._on_slider)
         layout.addWidget(self.slider)
 
@@ -131,7 +109,7 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_next = QtWidgets.QPushButton("Chan Next")
         self.btn_add = QtWidgets.QPushButton("Add Spike")
         self.btn_add.setCheckable(True)
-        self.btn_rm = QtWidgets.QPushButton("rm Spike")
+        self.btn_rm = QtWidgets.QPushButton("Rm Spike")
         self.btn_rm.setCheckable(True)
         self.btn_exit = QtWidgets.QPushButton("Exit")
         self.btn_save = QtWidgets.QPushButton("Save mk")
@@ -184,17 +162,13 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.btn_next.clicked.connect(self._next_channels)
         self.btn_add.clicked.connect(self._toggle_add_mode)
         self.btn_rm.clicked.connect(self._toggle_rm_mode)
-        self.btn_undo.clicked.connect(self._undo_last_removal)
+        self.btn_undo.clicked.connect(self._undo_last_action)
         self.btn_exit.clicked.connect(self._exit_app)
         self.btn_bp.clicked.connect(self._apply_bandpass)
         self.btn_notch.clicked.connect(self._apply_notch)
         self.btn_save.clicked.connect(self._save_markers)
-        
-
-
         self.btn_add_train.clicked.connect(self._toggle_add_train_mode)
 
-    # ---------------- Zoom ----------------
     def _zoom_in(self):
         self.gain *= 1.2
         self._plot_signals()
@@ -203,200 +177,127 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.gain /= 1.2
         self._plot_signals()
 
-    # ---------------- Channel navigation ----------------
     def _prev_channels(self):
         self.current_chan_start = max(0, self.current_chan_start - self.n_display)
         self._plot_signals()
 
     def _next_channels(self):
-        self.current_chan_start = min(self.n_channels - self.n_display,
-                                      self.current_chan_start + self.n_display)
+        max_start = max(0, self.n_channels - self.n_display)
+        self.current_chan_start = min(max_start, self.current_chan_start + self.n_display)
         self._plot_signals()
 
-    # ---------------- Mouse ----------------
     def on_mouse_press(self, ev):
-        
-        # -------- ADD TRAIN MODE --------
+        pos = ev.scenePos()
+        mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+        self._mouse_down_scene_pos = pos
+
         if self.add_train_mode:
-            pos = ev.scenePos()
-            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
-            
             self.drag_t0 = mouse_point.x()
             self.drag_y0 = mouse_point.y()
             self.dragging = True
-
             self.selection_item = pg.RectROI(
                 [self.drag_t0, self.drag_y0],
                 [0.001, 0.001],
-                pen=pg.mkPen((0, 0, 255), width=2)
+                pen=pg.mkPen((0, 0, 255), width=2),
             )
             self.plot_widget.addItem(self.selection_item)
             return
-        
-        # -------- ADD SINGLE MODE --------
+
         if self.add_mode:
-            pos = ev.scenePos()
-            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
-            
             self._add_marker_from_click(mouse_point.x(), mouse_point.y())
             return
-        
-        if not self.rm_mode:
-            return
-        pos = ev.scenePos()
-        mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
-        self.drag_t0 = mouse_point.x()
-        self.dragging = True
-        self.selection_item = pg.LinearRegionItem(values=(self.drag_t0, self.drag_t0),
-                                                 brush=(255, 0, 0, 40))
-        self.plot_widget.addItem(self.selection_item)
+
+        if self.rm_mode:
+            self.drag_t0 = mouse_point.x()
+            self.drag_y0 = mouse_point.y()
+            self.dragging = True
+            self.selection_item = pg.RectROI(
+                [self.drag_t0, self.drag_y0],
+                [0.001, 0.001],
+                pen=pg.mkPen((220, 0, 0), width=2),
+            )
+            self.plot_widget.addItem(self.selection_item)
 
     def on_mouse_move(self, ev):
-        # --------- RM SPIKE MODE ------------
-        if self.rm_mode and self.dragging:
-            pos = ev.scenePos()
-            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
-            self.selection_item.setRegion((self.drag_t0, mouse_point.x()))
-            
-        # --------- ADD TRAIN MODE ---------
-        if self.add_train_mode and self.dragging:
-            pos = ev.scenePos()
-            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+        if not self.dragging:
+            return
 
+        pos = ev.scenePos()
+        mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+
+        if self.rm_mode or self.add_train_mode:
             x0, y0 = self.drag_t0, self.drag_y0
             x1, y1 = mouse_point.x(), mouse_point.y()
-
             self.selection_item.setPos(min(x0, x1), min(y0, y1))
             self.selection_item.setSize((abs(x1 - x0), abs(y1 - y0)))
-            return
 
     def on_mouse_release(self, ev):
-        
-        # ---------- ADD TRAIN MODE ----------
         if self.add_train_mode and self.dragging:
-            roi = self.selection_item
-
-            pos = roi.pos()
-            size = roi.size()
-
-            t0, t1 = pos.x(), pos.x() + size.x()
-            y0, y1 = pos.y(), pos.y() + size.y()
-
+            t0, t1, y0, y1 = self._roi_bounds(self.selection_item)
             self._add_train_markers(t0, t1, y0, y1)
-
-            self.plot_widget.removeItem(self.selection_item)
-            self.selection_item = None
-            self.dragging = False
+            self._clear_selection()
             return
 
-        if not self.rm_mode or not self.dragging:
-            return
-
-        # ---------- RM SPIKE MODE ----------
         if self.rm_mode and self.dragging:
-            t0, t1 = self.selection_item.getRegion()
-            self._remove_markers_in_window(t0, t1)
-            self.plot_widget.removeItem(self.selection_item)
-            self.selection_item = None
-            self.dragging = False
-            return
-        
-        
+            pos = ev.scenePos()
+            mouse_point = self.plot_widget.getViewBox().mapSceneToView(pos)
+            moved = self._mouse_moved_enough(pos)
 
-    # ---------------- rm Spike ----------------
+            if moved:
+                t0, t1, y0, y1 = self._roi_bounds(self.selection_item)
+                self._remove_markers_in_rect(t0, t1, y0, y1)
+            else:
+                self._remove_nearest_marker(mouse_point.x(), mouse_point.y())
+
+            self._clear_selection()
+
     def _toggle_rm_mode(self):
         self.rm_mode = self.btn_rm.isChecked()
+        if self.rm_mode:
+            self._set_add_mode(False)
+            self._set_add_train_mode(False)
         self.btn_rm.setStyleSheet("background-color: red; color: white;" if self.rm_mode else "")
 
     def _add_marker_from_click(self, t_click, y_click):
-
-        if self.markers_df is None:
-            self.markers_df = pd.DataFrame(columns=["channel", "sample"])
-
-        # ---------------------------
-        # 1. trouver le channel
-        # ---------------------------
-        offset = 0
-        selected_channel = None
-        selected_idx = None
-
+        self._ensure_markers_df()
         selected_channel, selected_idx = self._get_closest_channel(t_click, y_click)
 
         if selected_channel is None:
             return
 
-        # ---------------------------
-        # 2. convertir temps → sample
-        # ---------------------------
-        sample = int(t_click * self.fs)
-
-        # sécurité
+        sample = self._time_to_sample(t_click)
         if sample < 0 or sample >= self.n_times:
             return
 
-        # ---------------------------
-        # 3. chercher max local ±5
-        # ---------------------------
         window = 15
         s0 = max(0, sample - window)
         s1 = min(self.n_times, sample + window + 1)
-
         segment = self.signals[selected_idx, s0:s1]
 
         if len(segment) == 0:
             return
 
-        local_idx = np.argmax(np.abs(segment))
-        best_sample = s0 + local_idx
+        best_sample = s0 + int(np.argmax(np.abs(segment)))
+        self._push_undo()
 
-        # ---------------------------
-        # 4. sauvegarde pour undo
-        # ---------------------------
-        self._undo_stack.append(self.markers_df.copy())
-
-        # ---------------------------
-        # 5. ajout du marqueur
-        # ---------------------------
-        new_row = pd.DataFrame({
-            "channel": [selected_channel],
-            "sample": [best_sample]
-        })
-
+        new_row = pd.DataFrame({"channel": [selected_channel], "sample": [best_sample]})
         self.markers_df = pd.concat([self.markers_df, new_row], ignore_index=True)
-
-        # ---------------------------
-        # 6. refresh affichage
-        # ---------------------------
         self._update_spikes_display()
-        
-   
+
     def _add_train_markers(self, t0, t1, y0, y1):
+        self._ensure_markers_df()
 
-        if self.markers_df is None:
-            self.markers_df = pd.DataFrame(columns=["channel", "sample"])
-
-        # ---------------------------
-        # 1. bornes temporelles
-        # ---------------------------
-        s0 = max(0, int(t0 * self.fs))
-        s1 = min(self.n_times, int(t1 * self.fs))
+        s0 = max(0, self._time_to_sample(min(t0, t1)))
+        s1 = min(self.n_times, self._time_to_sample(max(t0, t1)))
 
         if s1 <= s0:
             return
 
-        # ---------------------------
-        # 2. trouver le meilleur channel
-        # ---------------------------
-        offset = 0
         best_score = -np.inf
         best_idx = None
 
-        for ch_idx in range(self.current_chan_start,
-                            min(self.current_chan_start + self.n_display, self.n_channels)):
-
+        for ch_idx, offset in self._visible_channel_offsets():
             sig = self.signals[ch_idx, s0:s1] * self.gain + offset
-
-            # score = nombre de points dans la fenêtre Y
             mask = (sig >= min(y0, y1)) & (sig <= max(y0, y1))
             score = np.sum(mask)
 
@@ -404,120 +305,114 @@ class EEGEditor(QtWidgets.QMainWindow):
                 best_score = score
                 best_idx = ch_idx
 
-            offset += self.channel_spacing
-
         if best_idx is None or best_score == 0:
             return
 
         selected_channel = self.channel_names[best_idx]
-
-        # ---------------------------
-        # 3. extraire segment brut (sans offset)
-        # ---------------------------
         segment = self.signals[best_idx, s0:s1]
-
-        # ---------------------------
-        # 4. détecter pics + et -
-        # ---------------------------
         noise_level = np.median(np.abs(segment)) / 0.6745
 
         peaks_pos, _ = find_peaks(
             segment,
             prominence=2 * noise_level,
-            distance=int(0.01 * self.fs)
+            distance=max(1, int(0.01 * self.fs)),
         )
-
         peaks_neg, _ = find_peaks(
             -segment,
             prominence=2 * noise_level,
-            distance=int(0.01 * self.fs)
+            distance=max(1, int(0.01 * self.fs)),
         )
 
         peaks = np.concatenate([peaks_pos, peaks_neg])
-
         deriv = np.diff(segment)
-
-        slope_threshold = np.std(deriv) * self.bp_std_deriv_train.value()   # réglable
+        slope_threshold = np.std(deriv) * self.bp_std_deriv_train.value()
 
         good_peaks = []
-
         for p in peaks:
             if p <= 1 or p >= len(segment) - 2:
                 continue
 
             slope_before = abs(deriv[p - 1])
-            slope_after  = abs(deriv[p])
-
+            slope_after = abs(deriv[p])
             if slope_before > slope_threshold and slope_after > slope_threshold:
                 good_peaks.append(p)
 
         peaks = np.array(good_peaks)
-
         if len(peaks) == 0:
             return
 
-        # convertir en index global
         peaks_global = s0 + peaks
+        self._push_undo()
 
-        # ---------------------------
-        # 5. undo
-        # ---------------------------
-        self._undo_stack.append(self.markers_df.copy())
-
-        # ---------------------------
-        # 6. ajout markers
-        # ---------------------------
-        new_rows = pd.DataFrame({
-            "channel": [selected_channel] * len(peaks_global),
-            "sample": peaks_global
-        })
-
+        new_rows = pd.DataFrame(
+            {"channel": [selected_channel] * len(peaks_global), "sample": peaks_global}
+        )
         self.markers_df = pd.concat([self.markers_df, new_rows], ignore_index=True)
-
-        # ---------------------------
-        # 7. refresh
-        # ---------------------------
         self._update_spikes_display()
 
-    def _remove_markers_in_window(self, t0, t1):
+    def _remove_nearest_marker(self, t_click, y_click):
         if self.markers_df is None or len(self.markers_df) == 0:
             return
 
-        self._undo_stack.append(self.markers_df.copy())
+        candidates = self._visible_marker_positions()
+        if len(candidates) == 0:
+            return
 
-        s0, s1 = sorted([int(t0 * self.fs), int(t1 * self.fs)])
+        time_tol = max(0.05, self.window_sec * 0.015)
+        y_tol = self.channel_spacing * 0.35
+        dt = np.abs(candidates["time"].to_numpy() - t_click) / time_tol
+        dy = np.abs(candidates["y"].to_numpy() - y_click) / y_tol
+        score = dt + dy
+        best_pos = int(np.argmin(score))
 
-        visible_channels = self.channel_names[
-            self.current_chan_start : self.current_chan_start + self.n_display
-        ]
+        if dt[best_pos] > 1 or dy[best_pos] > 1:
+            return
 
-        mask_time = (self.markers_df["sample"] >= s0) & (self.markers_df["sample"] <= s1)
-        mask_chan = self.markers_df["channel"].isin(visible_channels)
-        mask_delete = mask_time & mask_chan
+        self._push_undo()
+        marker_index = candidates.iloc[best_pos]["marker_index"]
+        self.markers_df = self.markers_df.drop(index=marker_index).reset_index(drop=True)
+        self._update_spikes_display()
 
-        self.markers_df = self.markers_df[~mask_delete].reset_index(drop=True)
-        self._plot_signals()
-        
-        
-    # ---------------- Find channel close to clic ----------------
+    def _remove_markers_in_rect(self, t0, t1, y0, y1):
+        if self.markers_df is None or len(self.markers_df) == 0:
+            return
+
+        candidates = self._visible_marker_positions()
+        if len(candidates) == 0:
+            return
+
+        t_min, t_max = sorted([t0, t1])
+        y_min, y_max = sorted([y0, y1])
+        selected_channels = self._channels_in_y_range(y_min, y_max)
+
+        if len(selected_channels) == 0:
+            return
+
+        inside = (
+            (candidates["time"] >= t_min)
+            & (candidates["time"] <= t_max)
+            & (candidates["channel"].isin(selected_channels))
+        )
+        to_delete = candidates.loc[inside, "marker_index"]
+
+        if len(to_delete) == 0:
+            return
+
+        self._push_undo()
+        self.markers_df = self.markers_df.drop(index=to_delete).reset_index(drop=True)
+        self._update_spikes_display()
+
     def _get_closest_channel(self, t_click, y_click):
-
-        sample = int(t_click * self.fs)
-
-        # sécurité
+        sample = self._time_to_sample(t_click)
         if sample < 0 or sample >= self.n_times:
             return None, None
 
-        offset = 0
         best_dist = np.inf
         best_channel = None
         best_idx = None
 
-        for ch_idx in range(self.current_chan_start,
-                            min(self.current_chan_start + self.n_display, self.n_channels)):
-
+        for ch_idx, offset in self._visible_channel_offsets():
             y_signal = self.signals[ch_idx, sample] * self.gain + offset
-
             dist = abs(y_click - y_signal)
 
             if dist < best_dist:
@@ -525,30 +420,43 @@ class EEGEditor(QtWidgets.QMainWindow):
                 best_channel = self.channel_names[ch_idx]
                 best_idx = ch_idx
 
-            offset += self.channel_spacing
-
         return best_channel, best_idx
 
-    # ---------------- Add single ----------------
     def _toggle_add_mode(self):
-        self.add_mode = self.btn_add.isChecked()
-        self.btn_add.setStyleSheet("background-color: green; color: white;" if self.add_mode else "")
-        
-    # ---------------- Add train ----------------
+        self._set_add_mode(self.btn_add.isChecked())
+        if self.add_mode:
+            self._set_add_train_mode(False)
+            self._set_rm_mode(False)
+
     def _toggle_add_train_mode(self):
-        self.add_train_mode = self.btn_add_train.isChecked()
+        self._set_add_train_mode(self.btn_add_train.isChecked())
+        if self.add_train_mode:
+            self._set_add_mode(False)
+            self._set_rm_mode(False)
+
+    def _set_add_mode(self, enabled):
+        self.add_mode = enabled
+        self.btn_add.setChecked(enabled)
+        self.btn_add.setStyleSheet("background-color: green; color: white;" if enabled else "")
+
+    def _set_add_train_mode(self, enabled):
+        self.add_train_mode = enabled
+        self.btn_add_train.setChecked(enabled)
         self.btn_add_train.setStyleSheet(
-            "background-color: blue; color: white;" if self.add_train_mode else ""
+            "background-color: blue; color: white;" if enabled else ""
         )
-    
-    # ---------------- Undo ----------------
-    def _undo_last_removal(self):
+
+    def _set_rm_mode(self, enabled):
+        self.rm_mode = enabled
+        self.btn_rm.setChecked(enabled)
+        self.btn_rm.setStyleSheet("background-color: red; color: white;" if enabled else "")
+
+    def _undo_last_action(self):
         if len(self._undo_stack) == 0:
             return
         self.markers_df = self._undo_stack.pop()
         self._plot_signals()
 
-    # ---------------- Save ----------------
     def _save_markers(self):
         if self.markers_df is None:
             return
@@ -557,27 +465,45 @@ class EEGEditor(QtWidgets.QMainWindow):
             out = self.markers_df.rename(columns={"sample": "sample_index"})
             out.to_csv(path, sep="\t", index=False)
 
-    # ---------------- Filters ----------------
     def _apply_bandpass(self):
         low, high = self.bp_low.value(), self.bp_high.value()
-        b, a = butter(4, [low / (self.fs / 2), high / (self.fs / 2)], btype='band')
+        nyquist = self.fs / 2
+
+        if low <= 0 or high >= nyquist or low >= high:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Filtre invalide",
+                f"Choisir 0 < low < high < Nyquist ({nyquist:.1f} Hz).",
+            )
+            return
+
+        b, a = butter(4, [low / nyquist, high / nyquist], btype="band")
         self.signals = filtfilt(b, a, self.signals_raw, axis=1)
         self._plot_signals()
 
     def _apply_notch(self):
         f0 = self.notch_freq.value()
+        nyquist = self.fs / 2
+
+        if f0 <= 0 or f0 >= nyquist:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Notch invalide",
+                f"Choisir une frequence entre 0 et Nyquist ({nyquist:.1f} Hz).",
+            )
+            return
+
         b, a = iirnotch(f0, 30, self.fs)
         self.signals = filtfilt(b, a, self.signals, axis=1)
         self._plot_signals()
 
-    # ---------------- Navigation ----------------
     def on_wheel(self, ev):
         self.window_sec *= 0.9 if ev.delta() > 0 else 1.1
         self.window_sec = float(np.clip(self.window_sec, 1, 60))
         self._plot_signals()
 
     def _on_slider(self, value):
-        self.start_idx = value
+        self.start_idx = int(value)
         self._plot_signals()
 
     def keyPressEvent(self, event):
@@ -591,22 +517,22 @@ class EEGEditor(QtWidgets.QMainWindow):
             case QtCore.Qt.Key_Down:
                 self._next_channels()
             case QtCore.Qt.Key_PageDown:
-                self.slider.setValue(min(self.start_idx + (self.window_sec * int(self.fs)), self.n_times - 1))
+                step = int(self.window_sec * self.fs)
+                self.slider.setValue(min(self.start_idx + step, self.n_times - 1))
             case QtCore.Qt.Key_PageUp:
-                self.slider.setValue(max(self.start_idx - (self.window_sec * int(self.fs)), 0))
+                step = int(self.window_sec * self.fs)
+                self.slider.setValue(max(self.start_idx - step, 0))
             case QtCore.Qt.Key_Plus:
                 self._zoom_in()
             case QtCore.Qt.Key_Minus:
                 self._zoom_out()
+            case QtCore.Qt.Key_Z if event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+                self._undo_last_action()
 
-    # ---------------- Plot ----------------
     def _make_channel_ticks(self):
         ticks = []
-        offset = 0
-        for i in range(self.current_chan_start,
-                       min(self.current_chan_start + self.n_display, self.n_channels)):
+        for i, offset in self._visible_channel_offsets():
             ticks.append((offset, self.channel_names[i]))
-            offset += self.channel_spacing
         return [ticks]
 
     def _plot_signals(self):
@@ -614,29 +540,23 @@ class EEGEditor(QtWidgets.QMainWindow):
         self.curves.clear()
         self.spike_items.clear()
 
-        self.plot_item.getAxis('left').setTicks(self._make_channel_ticks())
+        self.plot_item.getAxis("left").setTicks(self._make_channel_ticks())
 
         win_len = int(self.window_sec * self.fs)
         end_idx = min(self.start_idx + win_len, self.n_times)
+        t = self.times[self.start_idx:end_idx]
 
-        offset = 0
-        for ch_idx in range(self.current_chan_start,
-                            min(self.current_chan_start + self.n_display, self.n_channels)):
-
+        for ch_idx, offset in self._visible_channel_offsets():
             sig = self.signals[ch_idx, self.start_idx:end_idx] * self.gain
-            t = self.times[self.start_idx:end_idx]
-
-                                                                                        # dessine les marquages
-            scatter = pg.ScatterPlotItem(pen=pg.mkPen(color=(255, 0, 0, 70), width=2),  # contour rouge transparent(70)
-                                         brush=None,                                          
-                                         symbol='o',
-                                         size=12)
+            scatter = pg.ScatterPlotItem(
+                pen=pg.mkPen(color=(255, 0, 0, 70), width=2),
+                brush=None,
+                symbol="o",
+                size=12,
+            )
             self.plot_widget.addItem(scatter)
             self.spike_items[ch_idx] = scatter
-
-            self.plot_widget.plot(t, sig + offset, pen=pg.mkPen('k'))        # Dessine les signaux
-
-            offset += self.channel_spacing
+            self.plot_widget.plot(t, sig + offset, pen=pg.mkPen("k"))
 
         self._update_spikes_display()
 
@@ -647,52 +567,135 @@ class EEGEditor(QtWidgets.QMainWindow):
         win_len = int(self.window_sec * self.fs)
         end_idx = min(self.start_idx + win_len, self.n_times)
 
-        offset = 0
-        for ch_idx in range(self.current_chan_start,
-                            min(self.current_chan_start + self.n_display, self.n_channels)):
-
+        for ch_idx, offset in self._visible_channel_offsets():
             rows = self.markers_df[self.markers_df["channel"] == self.channel_names[ch_idx]]
-            idx = rows["sample"].values
+            idx = rows["sample"].to_numpy(dtype=int)
+            idx = idx[(idx >= self.start_idx) & (idx < end_idx)]
 
-            mask = (idx >= self.start_idx) & (idx < end_idx)
-            idx = idx[mask]
+            if len(idx) == 0:
+                self.spike_items[ch_idx].setData([], [])
+                continue
 
             x = self.times[idx]
             y = self.signals[ch_idx, idx] * self.gain + offset
-
             self.spike_items[ch_idx].setData(x, y)
 
+    def _visible_channel_offsets(self):
+        offset = 0.0
+        stop = min(self.current_chan_start + self.n_display, self.n_channels)
+        for ch_idx in range(self.current_chan_start, stop):
+            yield ch_idx, offset
             offset += self.channel_spacing
 
+    def _channels_in_y_range(self, y_min, y_max):
+        channels = []
+        half_spacing = self.channel_spacing / 2
+
+        for ch_idx, offset in self._visible_channel_offsets():
+            channel_low = offset - half_spacing
+            channel_high = offset + half_spacing
+            if y_min <= channel_high and y_max >= channel_low:
+                channels.append(self.channel_names[ch_idx])
+
+        return channels
+
+    def _visible_marker_positions(self):
+        win_len = int(self.window_sec * self.fs)
+        end_idx = min(self.start_idx + win_len, self.n_times)
+        rows = []
+
+        for ch_idx, offset in self._visible_channel_offsets():
+            ch_name = self.channel_names[ch_idx]
+            channel_rows = self.markers_df[self.markers_df["channel"] == ch_name]
+            for marker_index, row in channel_rows.iterrows():
+                sample = int(row["sample"])
+                if sample < self.start_idx or sample >= end_idx:
+                    continue
+                if sample < 0 or sample >= self.n_times:
+                    continue
+                rows.append(
+                    {
+                        "marker_index": marker_index,
+                        "channel": ch_name,
+                        "sample": sample,
+                        "time": self.times[sample],
+                        "y": self.signals[ch_idx, sample] * self.gain + offset,
+                    }
+                )
+
+        return pd.DataFrame(rows)
+
+    def _time_to_sample(self, t):
+        return int(np.searchsorted(self.times, t, side="left"))
+
+    def _normalize_markers(self, markers_df):
+        if markers_df is None:
+            return pd.DataFrame(columns=["channel", "sample"])
+
+        markers = markers_df.copy()
+        if "sample" not in markers.columns and "sample_index" in markers.columns:
+            markers = markers.rename(columns={"sample_index": "sample"})
+        if "channel" not in markers.columns or "sample" not in markers.columns:
+            raise ValueError("markers_df doit contenir les colonnes 'channel' et 'sample'.")
+
+        markers = markers[["channel", "sample"]].copy()
+        markers["sample"] = markers["sample"].astype(int)
+        return markers.reset_index(drop=True)
+
+    def _ensure_markers_df(self):
+        if self.markers_df is None:
+            self.markers_df = pd.DataFrame(columns=["channel", "sample"])
+
+    def _push_undo(self):
+        self._undo_stack.append(self.markers_df.copy())
+
+    def _roi_bounds(self, roi):
+        pos = roi.pos()
+        size = roi.size()
+        t0, t1 = pos.x(), pos.x() + size.x()
+        y0, y1 = pos.y(), pos.y() + size.y()
+        return t0, t1, y0, y1
+
+    def _mouse_moved_enough(self, release_scene_pos):
+        if self._mouse_down_scene_pos is None:
+            return False
+        delta = release_scene_pos - self._mouse_down_scene_pos
+        return (delta.x() ** 2 + delta.y() ** 2) ** 0.5 >= 4
+
+    def _clear_selection(self):
+        if self.selection_item is not None:
+            self.plot_widget.removeItem(self.selection_item)
+        self.selection_item = None
+        self.dragging = False
+        self.drag_t0 = None
+        self.drag_y0 = None
+        self._mouse_down_scene_pos = None
+
     def closeEvent(self, event):
-        # Supprime explicitement les items graphiques
         self.plot_widget.clear()
         self.plot_widget.setParent(None)
         self.plot_widget.deleteLater()
-
-        # Coupe les références circulaires (important avec ViewBox custom)
         self.view_box.editor = None
-
         event.accept()
-        
+
     def _exit_app(self):
         self.close()
         QtWidgets.QApplication.quit()
-        
 
-def launch_editor(signals, times, channel_names, markers_df=None,
-                  window_sec=20, n_display=60,
-                  resize=(1500, 800), move=(50, 200)):
-    """
-    Lance l'éditeur EEG avec gestion propre de QApplication.
-    Compatible Jupyter / IPython et scripts classiques.
-    """
 
-    from PySide6 import QtWidgets
-
-    # Cas Jupyter : active l'intégration Qt si besoin
+def launch_editor(
+    signals,
+    times,
+    channel_names,
+    markers_df=None,
+    window_sec=20,
+    n_display=60,
+    resize=(1500, 800),
+    move=(50, 200),
+):
     try:
         from IPython import get_ipython
+
         ip = get_ipython()
         if ip is not None:
             ip.run_line_magic("gui", "qt")
@@ -711,14 +714,13 @@ def launch_editor(signals, times, channel_names, markers_df=None,
         channel_names=channel_names,
         markers_df=markers_df,
         window_sec=window_sec,
-        n_display=n_display
+        n_display=n_display,
     )
 
     editor.show()
     editor.resize(*resize)
     editor.move(*move)
 
-    # Fermeture propre
     def _on_close():
         editor.deleteLater()
         if created_app:
